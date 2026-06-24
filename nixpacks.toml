@@ -1,0 +1,11 @@
+[phases.setup]
+nixPkgs = ["nodejs_20", "python312"]
+
+[phases.install]
+cmds = [
+  "npm install",
+  "pip install pdfplumber"
+]
+
+[start]
+cmd = "node bot.js"
