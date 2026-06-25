@@ -2,7 +2,6 @@
  * ============================================================
  *  TELEGRAM BOT — Tra cứu hàng nhập khẩu
  *  ePort Saigon Newport & eWMS Tân Cảng Warehousing
- *  + Tự động giải captcha bằng Claude Vision API
  * ============================================================
  */
 
@@ -16,18 +15,16 @@ const { spawnSync } = require('child_process');
 const BOT_TOKEN = process.env.BOT_TOKEN || '8998825716:AAHtqiT25SiwvxiUdXywC8qBAYe5CmehT8s';
 const PORT      = process.env.PORT || 3000;
 
-// State: lưu session tạm cho từng user
+// State: lưu session tạm cho từng user (captcha guid, config đang chờ)
 const sessions = {};
 
-// ── HTTP/HTTPS helper ──────────────────────────────────────────
+// ── HTTP helper ────────────────────────────────────────────────
 function request(opts, body) {
   return new Promise((resolve, reject) => {
-    const lib = (opts.port === 8010) ? https : https;
-    const options = {
-      ...opts,
-      rejectUnauthorized: false,
-      timeout: 30000,
-    };
+    const useHttp = opts._forceHttp;
+    const lib = useHttp ? http : https;
+    delete opts._forceHttp;
+    const options = { ...opts, rejectUnauthorized: false };
     const req = lib.request(options, res => {
       const chunks = [];
       res.on('data', c => chunks.push(c));
@@ -38,14 +35,14 @@ function request(opts, body) {
         resolve({ status: res.statusCode, data, raw });
       });
     });
-    req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
+    req.setTimeout(20000, () => { req.destroy(); reject(new Error('Timeout')); });
     req.on('error', reject);
     if (body) req.write(typeof body === 'string' ? body : JSON.stringify(body));
     req.end();
   });
 }
 
-// ── Telegram API ───────────────────────────────────────────────
+// ── Telegram API helpers ───────────────────────────────────────
 async function tgCall(method, params) {
   const body = JSON.stringify(params);
   const res = await request({
@@ -61,11 +58,47 @@ async function sendMsg(chatId, text, extra = {}) {
   return tgCall('sendMessage', { chat_id: chatId, text, parse_mode: 'HTML', ...extra });
 }
 
+async function sendPhoto(chatId, base64, caption = '') {
+  // Lưu tạm file ảnh rồi gửi bằng multipart
+  const tmpPath = path.join(os.tmpdir(), `captcha_${chatId}.png`);
+  fs.writeFileSync(tmpPath, Buffer.from(base64, 'base64'));
+  const fileData = fs.readFileSync(tmpPath);
+  const boundary = '----BotBoundary' + Date.now();
+  const CRLF = '\r\n';
+
+  const head = Buffer.from(
+    `--${boundary}${CRLF}` +
+    `Content-Disposition: form-data; name="chat_id"${CRLF}${CRLF}` +
+    `${chatId}${CRLF}` +
+    `--${boundary}${CRLF}` +
+    `Content-Disposition: form-data; name="caption"${CRLF}${CRLF}` +
+    `${caption}${CRLF}` +
+    `--${boundary}${CRLF}` +
+    `Content-Disposition: form-data; name="photo"; filename="captcha.png"${CRLF}` +
+    `Content-Type: image/png${CRLF}${CRLF}`
+  );
+  const tail = Buffer.from(`${CRLF}--${boundary}--${CRLF}`);
+  const bodyBuf = Buffer.concat([head, fileData, tail]);
+
+  const res = await request({
+    hostname: 'api.telegram.org',
+    path    : `/bot${BOT_TOKEN}/sendPhoto`,
+    method  : 'POST',
+    headers : {
+      'Content-Type'  : `multipart/form-data; boundary=${boundary}`,
+      'Content-Length': bodyBuf.length,
+    },
+  }, bodyBuf);
+  fs.unlinkSync(tmpPath);
+  return res.data;
+}
+
 // ── Download file từ Telegram ──────────────────────────────────
 async function downloadFile(fileId) {
   const info = await tgCall('getFile', { file_id: fileId });
   if (!info.ok) throw new Error('Không lấy được file path');
   const filePath = info.result.file_path;
+
   return new Promise((resolve, reject) => {
     const chunks = [];
     const req = https.get(
@@ -79,50 +112,6 @@ async function downloadFile(fileId) {
     req.setTimeout(30000, () => { req.destroy(); reject(new Error('Download timeout')); });
     req.on('error', reject);
   });
-}
-
-// ── Claude Vision: tự giải captcha ────────────────────────────
-async function solveCaptchaWithClaude(imgBase64) {
-  const body = JSON.stringify({
-    model     : 'claude-sonnet-4-6',
-    max_tokens: 100,
-    messages  : [{
-      role   : 'user',
-      content: [
-        {
-          type  : 'image',
-          source: { type: 'base64', media_type: 'image/png', data: imgBase64 },
-        },
-        {
-          type: 'text',
-          text: 'Đây là ảnh captcha. Hãy đọc và trả về ĐÚNG các ký tự trong ảnh, CHỈ trả về các ký tự đó, không giải thích gì thêm. Các ký tự thường là chữ hoa và số, khoảng 5-6 ký tự.',
-        },
-      ],
-    }],
-  });
-
-  try {
-    const res = await request({
-      hostname: 'api.anthropic.com',
-      path    : '/v1/messages',
-      method  : 'POST',
-      headers : {
-        'Content-Type'     : 'application/json',
-        'Content-Length'   : Buffer.byteLength(body),
-        'anthropic-version': '2023-06-01',
-      },
-    }, body);
-
-    if (res.data && res.data.content && res.data.content[0]) {
-      const text = res.data.content[0].text.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
-      console.log(`[Claude captcha] Đọc được: ${text}`);
-      return text;
-    }
-    return null;
-  } catch(e) {
-    console.error('[Claude captcha] Lỗi:', e.message);
-    return null;
-  }
 }
 
 // ── Đọc PDF bằng Python ───────────────────────────────────────
@@ -140,8 +129,17 @@ def extract(pdf_path):
         for page in pdf.pages:
             text += (page.extract_text() or "") + "\\n"
     result = {}
-    containers = re.findall(r'\\b[A-Z]{4}\\d{7}\\b', text)
-    if containers: result['containerNo'] = containers[0]
+
+    m_cont = re.search(r'CON[Ss]?TAINER\\b.{0,150}?([A-Z]{4}\\d{7})', text, re.IGNORECASE | re.DOTALL)
+    if m_cont:
+        result['containerNo'] = m_cont.group(1)
+    else:
+        hbl = result.get('hbl', '')
+        mbl = result.get('mbl', '')
+        all_iso = re.findall(r'\\b[A-Z]{4}\\d{7}\\b', text)
+        filtered = [c for c in all_iso if c != hbl and c != mbl]
+        if filtered: result['containerNo'] = filtered[0]
+
     m = re.search(r'VESSEL\\s*/?\\s*VOYAGE\\s*:?\\s*([A-Z][A-Z0-9 .\\-]+?)\\s*/\\s*([A-Z0-9\\-]+)', text, re.IGNORECASE)
     if m:
         result['vesselName'] = re.sub(r'\\s+', ' ', m.group(1)).strip().upper()
@@ -151,11 +149,14 @@ def extract(pdf_path):
         mg = re.search(r'VOYAGE\\s*:?\\s*([A-Z0-9\\-]+)', text, re.IGNORECASE)
         if mv: result['vesselName'] = re.sub(r'\\s+', ' ', mv.group(1)).strip().upper()
         if mg: result['voyage']     = mg.group(1).strip().upper()
+
     m = re.search(r'\\bHBL\\s*:?\\s*(\\S+)', text, re.IGNORECASE)
     if not m: m = re.search(r'HOUSE\\s*B/?L\\s*(?:NO\\.?)?\\s*:?\\s*(\\S+)', text, re.IGNORECASE)
     if m: result['hbl'] = m.group(1).strip()
+
     m = re.search(r'\\bMBL\\s*:?\\s*(\\S+)', text, re.IGNORECASE)
     if m: result['mbl'] = m.group(1).strip()
+
     m = re.search(r'PORT OF DISCHARGE\\s*:\\s*([^\\n]+)', text)
     if m:
         port = m.group(1).strip().upper()
@@ -165,10 +166,13 @@ def extract(pdf_path):
         else:                       result['siteId'] = 'CTL'
         result['portOfDischarge'] = m.group(1).strip()
     if 'siteId' not in result: result['siteId'] = 'CTL'
+
     m = re.search(r'WAREHOUSE\\s*:\\s*([^\\n]+)', text)
     if m: result['warehouse'] = m.group(1).strip()
+
     m = re.search(r'ETA\\s*:\\s*(\\d{1,2}/\\d{1,2}/\\d{4})', text)
     if m: result['eta'] = m.group(1).strip()
+
     return result
 
 try:
@@ -185,14 +189,24 @@ except Exception as e:
     if (!result.error && result.status === 0) break;
   }
   try { fs.unlinkSync(tmpPath); } catch {}
+
   if (!result || result.error || result.status !== 0)
     throw new Error('Không chạy được Python/pdfplumber');
+
   const data = JSON.parse(result.stdout.trim());
   if (data.error) throw new Error(data.error);
   return data;
 }
 
 // ── ePort: Tra cứu tàu ────────────────────────────────────────
+const EWMS_HEADERS = {
+  'Accept'    : 'application/json, text/plain, */*',
+  'Language'  : 'vn',
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+  'Referer'   : 'https://ewms.tancangwarehousing.com.vn/',
+  'Origin'    : 'https://ewms.tancangwarehousing.com.vn',
+};
+
 async function checkVessel(config) {
   const body = JSON.stringify({ siteId: config.siteId, vesselName: config.vesselName });
   const res = await request({
@@ -214,14 +228,6 @@ async function checkVessel(config) {
 }
 
 // ── eWMS: Lấy captcha ─────────────────────────────────────────
-const EWMS_HEADERS = {
-  'Accept'    : 'application/json, text/plain, */*',
-  'Language'  : 'vn',
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-  'Referer'   : 'https://ewms.tancangwarehousing.com.vn/',
-  'Origin'    : 'https://ewms.tancangwarehousing.com.vn',
-};
-
 async function getCaptchaData() {
   const res = await request({
     hostname: 'ewms.tancangwarehousing.com.vn',
@@ -231,14 +237,14 @@ async function getCaptchaData() {
     headers : EWMS_HEADERS,
   });
   if (res.status !== 200 || !res.data) return null;
+
   let imgB64 = null, guid = null;
   const scan = (obj, d=0) => {
     if (!obj || typeof obj !== 'object' || d > 5) return;
     for (const [k, v] of Object.entries(obj)) {
       const kl = k.toLowerCase();
       if (typeof v === 'string') {
-        if (v.length > 200 && (kl.includes('image')||kl.includes('base64')||kl.includes('img')||kl.includes('data')))
-          imgB64 = v.replace(/^data:image\/\w+;base64,/, '');
+        if (v.length > 200 && (kl.includes('image')||kl.includes('base64')||kl.includes('img')||kl.includes('data'))) imgB64 = v.replace(/^data:image\/\w+;base64,/, '');
         if ((kl.includes('guid')||kl==='id'||kl.includes('token')) && !guid) guid = v;
       } else if (typeof v === 'object') scan(v, d+1);
     }
@@ -285,10 +291,12 @@ function buildResultMsg(config, trip, whData) {
   const ci  = whData?.containersInfo?.[0];
   const lo  = whData?.consignmentsInfo?.[0];
   const isReceived = (ci?.status||'').toLowerCase().includes('hoàn tất') || (lo?.thongBao||'').includes('Nhập kho');
+  const now = new Date().toLocaleString('vi-VN');
   const icon = isReceived ? '✅' : '⏳';
+
   return [
     `${icon} <b>BÁO CÁO HÀNG NHẬP</b>`,
-    `🕐 ${new Date().toLocaleString('vi-VN')}`,
+    `🕐 ${now}`,
     '',
     `📄 <b>Bill (HBL):</b> <code>${lo?.billNo || config.hbl}</code>`,
     `📦 <b>Container:</b> <code>${ci?.containerNo || config.containerNo}</code>`,
@@ -307,142 +315,56 @@ function buildResultMsg(config, trip, whData) {
   ].join('\n');
 }
 
-// ── Xử lý captcha: tự động với Claude, fallback hỏi user ──────
-async function handleCaptchaAndWarehouse(chatId, config, trip, retryCount = 0) {
-  if (retryCount >= 3) {
-    return sendMsg(chatId, '❌ Đã thử captcha 3 lần không thành công. Vui lòng thử lại sau.');
-  }
-
-  await sendMsg(chatId, retryCount === 0
-    ? '⏳ Đang lấy captcha eWMS...'
-    : `🔄 Thử lại captcha lần ${retryCount + 1}...`
-  );
-
-  let captcha;
-  try {
-    captcha = await getCaptchaData();
-  } catch(e) {
-    // eWMS có thể chặn IP Railway — hỏi user nhập thủ công
-    await sendMsg(chatId,
-      '⚠️ Không kết nối được eWMS tự động.\n\n' +
-      'Vui lòng:\n' +
-      '1. Mở https://ewms.tancangwarehousing.com.vn/search/consignment\n' +
-      `2. Tra container <code>${config.containerNo}</code>\n` +
-      '3. Nhập mã captcha trên trang web\n' +
-      '4. Gửi kết quả (ngày vào kho) vào đây'
-    );
-    sessions[chatId] = { config, trip, waitingManual: true };
-    return;
-  }
-
-  if (!captcha) {
-    return sendMsg(chatId, '❌ Không lấy được captcha từ eWMS. Thử lại sau.');
-  }
-
-  // Thử tự giải bằng Claude Vision
-  await sendMsg(chatId, '🤖 Đang dùng AI đọc captcha...');
-  const autoCode = await solveCaptchaWithClaude(captcha.imgB64);
-
-  if (autoCode && autoCode.length >= 4) {
-    console.log(`[Auto captcha] Thử mã: ${autoCode}`);
-    try {
-      const result = await checkWarehouse(config, autoCode, captcha.guid);
-      if (result.captchaError) {
-        console.log(`[Auto captcha] Sai mã ${autoCode}, thử lại...`);
-        return handleCaptchaAndWarehouse(chatId, config, trip, retryCount + 1);
-      }
-      if (result.error) return sendMsg(chatId, `❌ Lỗi eWMS: ${result.error}`);
-      return sendMsg(chatId, buildResultMsg(config, trip, result.data));
-    } catch(e) {
-      // Lỗi kết nối eWMS
-      await sendMsg(chatId,
-        `⚠️ <b>Không kết nối được eWMS từ server.</b>\n\n` +
-        `eWMS có thể chặn IP cloud. Vui lòng tra thủ công:\n` +
-        `🔗 ewms.tancangwarehousing.com.vn/search/consignment\n` +
-        `📦 Container: <code>${config.containerNo}</code>\n` +
-        `📄 Bill: <code>${config.hbl}</code>\n\n` +
-        `Sau khi có kết quả, reply ngày vào kho vào đây.`
-      );
-      sessions[chatId] = { config, trip, waitingManual: true };
-      return;
-    }
-  }
-
-  // Claude không đọc được — gửi ảnh hỏi user
-  await sendMsg(chatId, '🔐 AI không đọc được captcha. Vui lòng nhập thủ công:');
-  // Gửi ảnh captcha qua sendPhoto multipart
-  const tmpPath = path.join(os.tmpdir(), `cap_${chatId}.png`);
-  fs.writeFileSync(tmpPath, Buffer.from(captcha.imgB64, 'base64'));
-  const fileData = fs.readFileSync(tmpPath);
-  const boundary = '----Boundary' + Date.now();
-  const CRLF = '\r\n';
-  const head = Buffer.from(
-    `--${boundary}${CRLF}Content-Disposition: form-data; name="chat_id"${CRLF}${CRLF}${chatId}${CRLF}` +
-    `--${boundary}${CRLF}Content-Disposition: form-data; name="caption"${CRLF}${CRLF}Nhập mã captcha:${CRLF}` +
-    `--${boundary}${CRLF}Content-Disposition: form-data; name="photo"; filename="captcha.png"${CRLF}Content-Type: image/png${CRLF}${CRLF}`
-  );
-  const tail = Buffer.from(`${CRLF}--${boundary}--${CRLF}`);
-  const bodyBuf = Buffer.concat([head, fileData, tail]);
-  try { fs.unlinkSync(tmpPath); } catch {}
-
-  await request({
-    hostname:'api.telegram.org', path:`/bot${BOT_TOKEN}/sendPhoto`, method:'POST',
-    headers:{'Content-Type':`multipart/form-data; boundary=${boundary}`,'Content-Length':bodyBuf.length},
-  }, bodyBuf);
-
-  sessions[chatId] = { config, trip, captchaGuid: captcha.guid, waitingCaptcha: true };
-}
-
-// ── Xử lý update ──────────────────────────────────────────────
+// ── Xử lý từng update từ Telegram ─────────────────────────────
 async function handleUpdate(update) {
-  const msg = update.message;
+  const msg    = update.message;
   if (!msg) return;
   const chatId = msg.chat.id;
   const text   = (msg.text || '').trim();
   const doc    = msg.document;
 
-  // /start hoặc /help
+  // Lệnh /start hoặc /help
   if (text === '/start' || text === '/help') {
     return sendMsg(chatId,
       '👋 <b>Chào mừng đến với Bot Tra Cứu Hàng Nhập!</b>\n\n' +
-      '📎 Gửi file <b>PDF Thông Báo Hàng Đến</b> vào đây\n' +
-      '🤖 Bot tự đọc thông tin + tra cứu ePort & eWMS\n' +
-      '📲 Kết quả gửi lại ngay trong chat này\n\n' +
-      'Hãy gửi file PDF ngay!'
+      'Cách dùng:\n' +
+      '1️⃣ Gửi file <b>PDF Thông Báo Hàng Đến</b> vào đây\n' +
+      '2️⃣ Bot tự đọc thông tin tàu, container, bill\n' +
+      '3️⃣ Tra cứu ePort + eWMS tự động\n' +
+      '4️⃣ Gửi kết quả về cho bạn\n\n' +
+      '📎 Hãy gửi file PDF ngay!'
     );
   }
 
-  // Đang chờ user nhập captcha thủ công
-  if (sessions[chatId]?.waitingCaptcha && text) {
+  // Nhận captcha từ user
+  if (sessions[chatId] && sessions[chatId].waitingCaptcha && text) {
     const session = sessions[chatId];
     delete sessions[chatId].waitingCaptcha;
+
     await sendMsg(chatId, '⏳ Đang tra cứu kho...');
+
     try {
       const result = await checkWarehouse(session.config, text.toUpperCase(), session.captchaGuid);
-      if (result.captchaError) {
-        await sendMsg(chatId, '❌ Mã captcha sai. Đang thử lại...');
-        return handleCaptchaAndWarehouse(chatId, session.config, session.trip, 1);
-      }
-      if (result.error) return sendMsg(chatId, `❌ Lỗi: ${result.error}`);
-      delete sessions[chatId];
-      return sendMsg(chatId, buildResultMsg(session.config, session.trip, result.data));
-    } catch(e) {
-      return sendMsg(chatId, `❌ Lỗi kết nối: ${e.message}`);
-    }
-  }
 
-  // Đang chờ user nhập kết quả thủ công
-  if (sessions[chatId]?.waitingManual && text) {
-    const session = sessions[chatId];
-    delete sessions[chatId];
-    return sendMsg(chatId,
-      `✅ <b>Đã ghi nhận thông tin thủ công</b>\n\n` +
-      `📄 HBL: <code>${session.config.hbl}</code>\n` +
-      `📦 Container: <code>${session.config.containerNo}</code>\n` +
-      `🚢 Tàu: ${session.config.vesselName} / ${session.config.voyage}\n` +
-      `⚓ ATB: ${session.trip?.ACTUAL_BERTH_TIME || '—'}\n` +
-      `💬 Ghi chú: ${text}`
-    );
+      if (result.captchaError) {
+        // Captcha sai — lấy captcha mới
+        await sendMsg(chatId, '❌ Mã captcha không đúng. Đang lấy mã mới...');
+        const captcha = await getCaptchaData();
+        if (!captcha) return sendMsg(chatId, '❌ Không lấy được captcha. Thử lại sau.');
+        sessions[chatId] = { ...session, captchaGuid: captcha.guid, waitingCaptcha: true };
+        await sendPhoto(chatId, captcha.imgB64, '🔐 Nhập mã captcha trong ảnh:');
+        return;
+      }
+
+      if (result.error) return sendMsg(chatId, `❌ Lỗi: ${result.error}`);
+
+      const msg = buildResultMsg(session.config, session.trip, result.data);
+      delete sessions[chatId];
+      return sendMsg(chatId, msg);
+
+    } catch(e) {
+      return sendMsg(chatId, `❌ Lỗi khi tra cứu: ${e.message}`);
+    }
   }
 
   // Nhận file PDF
@@ -453,10 +375,13 @@ async function handleUpdate(update) {
     }
 
     await sendMsg(chatId, '📄 Đang đọc file PDF...');
-    try {
-      const pdfBuffer = await downloadFile(doc.file_id);
-      const config = parsePDF(pdfBuffer);
 
+    try {
+      // Download PDF
+      const pdfBuffer = await downloadFile(doc.file_id);
+
+      // Parse PDF
+      const config = parsePDF(pdfBuffer);
       const missing = [];
       if (!config.vesselName)  missing.push('VESSEL');
       if (!config.voyage)      missing.push('VOYAGE');
@@ -465,8 +390,8 @@ async function handleUpdate(update) {
 
       if (missing.length) {
         return sendMsg(chatId,
-          `⚠️ Không đọc được: <b>${missing.join(', ')}</b>\n` +
-          `Dữ liệu tìm được: <code>${JSON.stringify(config)}</code>`
+          `⚠️ Không đọc được: <b>${missing.join(', ')}</b> từ PDF.\n` +
+          `Dữ liệu tìm được: ${JSON.stringify(config)}`
         );
       }
 
@@ -479,6 +404,7 @@ async function handleUpdate(update) {
         `⏳ Đang tra cứu tàu trên ePort...`
       );
 
+      // Tra cứu tàu
       const trip = await checkVessel(config);
       if (!trip) {
         return sendMsg(chatId,
@@ -497,11 +423,27 @@ async function handleUpdate(update) {
         );
       }
 
-      await sendMsg(chatId, `⚓ Tàu đã cập lúc <b>${atb}</b>\n⏳ Đang kiểm tra hàng vào kho...`);
-      await handleCaptchaAndWarehouse(chatId, config, trip);
+      await sendMsg(chatId,
+        `⚓ Tàu đã cập cảng lúc <b>${atb}</b>\n\n` +
+        `⏳ Đang lấy captcha eWMS...`
+      );
+
+      // Lấy captcha
+      const captcha = await getCaptchaData();
+      if (!captcha) return sendMsg(chatId, '❌ Không lấy được captcha từ eWMS. Thử lại sau.');
+
+      // Lưu session
+      sessions[chatId] = {
+        config,
+        trip,
+        captchaGuid  : captcha.guid,
+        waitingCaptcha: true,
+      };
+
+      // Gửi ảnh captcha
+      await sendPhoto(chatId, captcha.imgB64, '🔐 Nhập mã captcha trong ảnh để tra cứu kho:');
 
     } catch(e) {
-      console.error('handleUpdate error:', e);
       return sendMsg(chatId, `❌ Lỗi: ${e.message}`);
     }
   }
@@ -513,12 +455,21 @@ const server = http.createServer(async (req, res) => {
     let body = '';
     req.on('data', c => body += c);
     req.on('end', async () => {
-      try { await handleUpdate(JSON.parse(body)); } catch(e) { console.error(e.message); }
-      res.writeHead(200); res.end('OK');
+      try {
+        const update = JSON.parse(body);
+        await handleUpdate(update);
+      } catch(e) {
+        console.error('handleUpdate error:', e.message);
+      }
+      res.writeHead(200);
+      res.end('OK');
     });
   } else {
-    res.writeHead(200); res.end('🚢 Import Check Bot đang chạy!');
+    res.writeHead(200);
+    res.end('🚢 Import Check Bot đang chạy!');
   }
 });
 
-server.listen(PORT, () => console.log(`✅ Bot server đang chạy trên port ${PORT}`));
+server.listen(PORT, () => {
+  console.log(`✅ Bot server đang chạy trên port ${PORT}`);
+});
